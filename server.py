@@ -2,6 +2,7 @@ import difflib
 import json
 import re
 import os
+import shutil
 import statistics
 import tempfile
 import threading
@@ -13,23 +14,38 @@ import yt_dlp
 from flask import Flask, jsonify, redirect, request
 from flask_cors import CORS
 
+# ---------- Cookies (Render Secret File) ----------
+COOKIE_SRC = "/etc/secrets/cookies.txt"
+COOKIE_FILE = "/tmp/cookies.txt"
+if os.path.exists(COOKIE_SRC):
+    shutil.copy(COOKIE_SRC, COOKIE_FILE)
+
+
+def ydl_opts(**extra):
+    o = {"quiet": True, "skip_download": True}
+    if os.path.exists(COOKIE_FILE):
+        o["cookiefile"] = COOKIE_FILE
+    o.update(extra)
+    return o
+
+
 app = Flask(__name__)
 CORS(app)
 
 MAX_SECONDS = 10 * 60   # bỏ video dài hơn 10 phút (mix, playlist, live). Đặt None để giữ lại tất cả
-DURATION_TOLERANCE = 6   # giây, độ lệch tối đa khi ghép lời với bài (trước đây 12 -> hay ghép nhầm bản thu khác)
+DURATION_TOLERANCE = 6   # giây, độ lệch tối đa khi ghép lời với bài
 META = {}                # id -> {title, artist, duration}, lưu lại từ lúc tìm kiếm
 LYRICS = {}              # id -> kết quả lời, tránh hỏi lại
-USE_WHISPER = True       # tự nghe nhạc để căn lời khi video không có phụ đề (cần: pip install faster-whisper + ffmpeg)
-WHISPER_MODEL = "small"  # base nhanh hơn nhưng nhận tiếng Việt kém hơn; small cân bằng
-WHISPER_SECONDS = 100    # chỉ nghe 100 giây đầu của bài
+USE_WHISPER = False      # Render free không đủ RAM chạy Whisper
+WHISPER_MODEL = "small"
+WHISPER_SECONDS = 100
 _whisper = {"model": None}
 _whisper_lock = threading.Lock()
 OFFSETS = {}             # id -> độ lệch tự tính (giây) hoặc None
 
 
 def run_search(q, n=25):
-    opts = {"quiet": True, "extract_flat": True, "skip_download": True}
+    opts = ydl_opts(extract_flat=True)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(f"ytsearch{n}:{q}", download=False)
     out = []
@@ -51,6 +67,11 @@ def run_search(q, n=25):
     return out
 
 
+@app.route("/")
+def home():
+    return jsonify({"status": "ok"})
+
+
 @app.route("/search")
 def search():
     q = request.args.get("q", "").strip()
@@ -59,7 +80,6 @@ def search():
     try:
         out = run_search(q)
         if len(out) < 6:
-            # kết quả toàn mix/playlist dài bị lọc hết -> tìm lại thiên về bài đơn lẻ
             seen = {x["id"] for x in out}
             out += [x for x in run_search(q + " official mv") if x["id"] not in seen]
     except Exception as e:
@@ -70,8 +90,7 @@ def search():
 
 @app.route("/stream/<vid>")
 def stream(vid):
-    opts = {"quiet": True, "skip_download": True,
-            "format": "bestaudio[ext=m4a]/bestaudio"}
+    opts = ydl_opts(format="bestaudio[ext=m4a]/bestaudio")
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
     return redirect(info["url"])
@@ -96,7 +115,7 @@ def lrclib(path, **params):
 def get_meta(vid):
     if vid in META and META[vid].get("title"):
         return META[vid]
-    opts = {"quiet": True, "skip_download": True}
+    opts = ydl_opts()
     with yt_dlp.YoutubeDL(opts) as ydl:
         i = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
     META[vid] = {
@@ -228,7 +247,7 @@ def parse_lrc(txt):
 
 def caption_cues(vid):
     """[(giây, chữ)] từ phụ đề video (ưu tiên phụ đề thật, sau đó phụ đề tự động tiếng Việt)"""
-    with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True}) as ydl:
+    with yt_dlp.YoutubeDL(ydl_opts()) as ydl:
         i = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
     for pool in (i.get("subtitles") or {}, i.get("automatic_captions") or {}):
         for lang in ("vi", "vi-orig", "vi-VN"):
@@ -281,9 +300,10 @@ def whisper_words(vid):
     """nghe ~100 giây đầu bài, trả về [(giây, từ)]"""
     from faster_whisper import WhisperModel
     with tempfile.TemporaryDirectory() as tmp:
-        opts = {"quiet": True, "format": "bestaudio", "outtmpl": os.path.join(tmp, "a.%(ext)s"),
-                "download_ranges": yt_dlp.utils.download_range_func(None, [(0, WHISPER_SECONDS)]),
-                "force_keyframes_at_cuts": True}
+        opts = ydl_opts(skip_download=False, format="bestaudio",
+                        outtmpl=os.path.join(tmp, "a.%(ext)s"),
+                        download_ranges=yt_dlp.utils.download_range_func(None, [(0, WHISPER_SECONDS)]),
+                        force_keyframes_at_cuts=True)
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([f"https://www.youtube.com/watch?v={vid}"])
         path = os.path.join(tmp, os.listdir(tmp)[0])
@@ -349,6 +369,5 @@ def offset(vid):
     return jsonify({"offset": OFFSETS[vid]})
 
 
-
 if __name__ == "__main__":
-    app.run(port=5000, threaded=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), threaded=True)
