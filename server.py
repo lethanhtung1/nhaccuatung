@@ -1,4 +1,5 @@
 import difflib
+import time
 import json
 import re
 import os
@@ -44,7 +45,14 @@ _whisper_lock = threading.Lock()
 OFFSETS = {}             # id -> độ lệch tự tính (giây) hoặc None
 
 
-def run_search(q, n=25):
+SEARCH_CACHE = {}        # q -> (thời điểm, kết quả)
+SEARCH_TTL = 6 * 3600    # giữ kết quả tìm kiếm 6 giờ
+_search_lock = threading.Lock()
+HOME_QUERIES = ["nhạc trẻ việt hay nhất mv", "lofi chill song", "nhạc đêm khuya buồn mv",
+                "ballad việt mv", "piano nhạc không lời"]
+
+
+def run_search(q, n=15):
     opts = ydl_opts(extract_flat=True)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(f"ytsearch{n}:{q}", download=False)
@@ -67,6 +75,37 @@ def run_search(q, n=25):
     return out
 
 
+def cached_search(q):
+    now = time.time()
+    hit = SEARCH_CACHE.get(q)
+    if hit and now - hit[0] < SEARCH_TTL:
+        return hit[1]
+    out = run_search(q)
+    if len(out) < 3:
+        seen = {x["id"] for x in out}
+        out += [x for x in run_search(q + " official mv") if x["id"] not in seen]
+    out = out[:12]
+    if out:
+        SEARCH_CACHE[q] = (now, out)
+    return out
+
+
+def warm_home():
+    """tải sẵn các mục trang chủ, lần lượt từng cái để không nghẽn CPU"""
+    while True:
+        for q in HOME_QUERIES:
+            try:
+                SEARCH_CACHE.pop(q, None)
+                cached_search(q)
+            except Exception as e:
+                print("[warm] lỗi:", repr(e))
+            time.sleep(2)
+        time.sleep(SEARCH_TTL - 600)
+
+
+threading.Thread(target=warm_home, daemon=True).start()
+
+
 @app.route("/")
 def home():
     return jsonify({"status": "ok"})
@@ -78,14 +117,11 @@ def search():
     if not q:
         return jsonify([])
     try:
-        out = run_search(q)
-        if len(out) < 6:
-            seen = {x["id"] for x in out}
-            out += [x for x in run_search(q + " official mv") if x["id"] not in seen]
+        out = cached_search(q)
     except Exception as e:
         print("[search] lỗi:", repr(e))
         return jsonify([])
-    return jsonify(out[:12])
+    return jsonify(out)
 
 
 @app.route("/stream/<vid>")
