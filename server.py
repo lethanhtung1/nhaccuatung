@@ -75,18 +75,20 @@ def run_search(q, n=15):
     return out
 
 
-def cached_search(q):
+def cached_search(q, limit=12):
     now = time.time()
-    hit = SEARCH_CACHE.get(q)
+    key = (q, limit)
+    hit = SEARCH_CACHE.get(key)
     if hit and now - hit[0] < SEARCH_TTL:
         return hit[1]
-    out = run_search(q)
-    if len(out) < 3:
+    fetch_n = 15 if limit <= 12 else min(limit + 15, 60)
+    out = run_search(q, fetch_n)
+    if len(out) < min(limit, 6):
         seen = {x["id"] for x in out}
-        out += [x for x in run_search(q + " official mv") if x["id"] not in seen]
-    out = out[:12]
+        out += [x for x in run_search(q + " official mv", fetch_n) if x["id"] not in seen]
+    out = out[:limit]
     if out:
-        SEARCH_CACHE[q] = (now, out)
+        SEARCH_CACHE[key] = (now, out)
     return out
 
 
@@ -95,7 +97,7 @@ def warm_home():
     while True:
         for q in HOME_QUERIES:
             try:
-                SEARCH_CACHE.pop(q, None)
+                SEARCH_CACHE.pop((q, 12), None)
                 cached_search(q)
             except Exception as e:
                 print("[warm] lỗi:", repr(e))
@@ -117,7 +119,8 @@ def search():
     if not q:
         return jsonify([])
     try:
-        out = cached_search(q)
+        n = max(1, min(int(request.args.get("n", 12)), 50))
+        out = cached_search(q, n)
     except Exception as e:
         print("[search] lỗi:", repr(e))
         return jsonify([])
