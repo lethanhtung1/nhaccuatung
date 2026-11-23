@@ -171,6 +171,8 @@ def pack(x, dur):
         "plainLyrics": x.get("plainLyrics"),
         "lrcDuration": x.get("duration"),
         "videoDuration": dur,
+        "trackName": x.get("trackName"),
+        "artistName": x.get("artistName"),
     }
 
 
@@ -203,6 +205,25 @@ def find_lyrics(meta):
         """kết quả LRCLIB phải có tên bài nằm trong tiêu đề video, không thì bỏ (tránh lấy nhầm bài khác)"""
         nm = compact(re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", x.get("trackName") or ""))
         return len(nm) >= 2 and nm in raw_c
+
+    def diff(x):
+        if not dur or not x.get("duration"):
+            return 0
+        return abs(x["duration"] - dur)
+
+    pool = {}  # mọi bản lời hợp lệ đã gặp, để người nghe đổi qua lại
+
+    def add(x):
+        if x.get("syncedLyrics") or x.get("plainLyrics"):
+            pool[x.get("id") or id(x)] = x
+
+    def done(x):
+        r = pack(x, dur)
+        others = sorted((y for y in pool.values() if y is not x),
+                        key=lambda y: (not y.get("syncedLyrics"), diff(y)))
+        r["alts"] = [pack(y, dur) for y in others[:6]]
+        return r
+
     first = parts[0] if parts else whole
 
     # các cách đoán, thử lần lượt: (nghệ sĩ, tên bài)
@@ -217,7 +238,7 @@ def find_lyrics(meta):
     if len(compact(first)) >= 4:
         queries += [{"q": f"{first} {artist}".strip()}, {"q": first}]
 
-    seen, fallback = set(), None
+    seen, fallback, best = set(), None, None
     for params in queries:
         key = json.dumps(params, sort_keys=True)
         if key in seen:
@@ -229,7 +250,9 @@ def find_lyrics(meta):
             try:
                 x = lrclib("get", duration=int(dur), **params)
                 if x.get("syncedLyrics") and verified(x):
-                    return pack(x, dur)
+                    add(x)
+                    best = x
+                    break
             except Exception:
                 pass
 
@@ -237,32 +260,46 @@ def find_lyrics(meta):
             res = [x for x in lrclib("search", **params) if verified(x)]
         except Exception:
             continue
-
-        def diff(x):
-            if not dur or not x.get("duration"):
-                return 0
-            return abs(x["duration"] - dur)
+        for x in res:
+            add(x)
 
         # chọn bản synced có thời lượng GẦN NHẤT
         synced = sorted((x for x in res if x.get("syncedLyrics")), key=diff)
         if synced and diff(synced[0]) <= DURATION_TOLERANCE:
-            return pack(synced[0], dur)
+            best = synced[0]
+            break
         if fallback is None:
             plain = [x for x in res if x.get("plainLyrics") and diff(x) <= 15]
             if synced and diff(synced[0]) <= 15:
                 fallback = synced[0]
             elif plain:
                 fallback = plain[0]
-    return pack(fallback, dur) if fallback else {}
+    pick = best or fallback
+    if not pick and pool:
+        # không bản nào đúng độ dài: vẫn đưa bản gần nhất để người nghe tự chỉnh hoặc đổi bản
+        pick = sorted(pool.values(), key=lambda y: (not y.get("syncedLyrics"), diff(y)))[0]
+    return done(pick) if pick else {}
 
 
 @app.route("/lyrics/<vid>")
 def lyrics(vid):
+    # giao diện gửi sẵn tên bài/ca sĩ/độ dài để khỏi phải hỏi YouTube (hay bị chặn trên Render)
+    t = request.args.get("t", "").strip()
+    if t:
+        try:
+            d = float(request.args.get("d") or 0) or None
+        except ValueError:
+            d = None
+        META[vid] = {"title": t[:300], "artist": request.args.get("a", "")[:200], "duration": d}
     if vid not in LYRICS:
         try:
-            LYRICS[vid] = find_lyrics(get_meta(vid))
-        except Exception:
+            res = find_lyrics(get_meta(vid))
+        except Exception as e:
+            print("[lyrics] lỗi:", repr(e))
             return jsonify({})
+        if res:
+            LYRICS[vid] = res
+        return jsonify(res)
     return jsonify(LYRICS[vid])
 
 
