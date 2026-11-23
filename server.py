@@ -154,6 +154,17 @@ def lrclib(path, **params):
 def get_meta(vid):
     if vid in META and META[vid].get("title"):
         return META[vid]
+    # oEmbed của YouTube nhẹ và hiếm khi bị chặn như yt-dlp
+    try:
+        u = "https://www.youtube.com/oembed?format=json&url=" + urllib.parse.quote(f"https://www.youtube.com/watch?v={vid}")
+        req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            o = json.load(r)
+        if o.get("title"):
+            META[vid] = {"title": o["title"], "artist": o.get("author_name") or "", "duration": None}
+            return META[vid]
+    except Exception as e:
+        print("[meta] oembed lỗi:", repr(e))
     opts = ydl_opts()
     with yt_dlp.YoutubeDL(opts) as ydl:
         i = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
