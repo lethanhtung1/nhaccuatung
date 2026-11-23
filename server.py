@@ -570,6 +570,42 @@ def login():
     return jsonify({"token": _tokens().dumps({"id": row[0], "u": u}), "username": u})
 
 
+def clean_track(f):
+    if isinstance(f, dict) and re.fullmatch(r"[\w-]{6,20}", str(f.get("id", ""))):
+        return {"id": f["id"], "title": str(f.get("title") or "")[:300],
+                "artist": str(f.get("artist") or "")[:200],
+                "mood": f.get("mood") if isinstance(f.get("mood"), str) else None,
+                "duration": f.get("duration") if isinstance(f.get("duration"), (int, float)) else None}
+    return None
+
+
+def clean_lists(raw):
+    """danh sách các playlist: [{id, name, items:[track]}], luôn có playlist 'fav' đứng đầu"""
+    out = []
+    for L in (raw if isinstance(raw, list) else [])[:30]:
+        if not isinstance(L, dict):
+            continue
+        lid = str(L.get("id", ""))
+        if not re.fullmatch(r"[\w-]{1,30}", lid) or any(x["id"] == lid for x in out):
+            continue
+        items = L.get("items") if isinstance(L.get("items"), list) else []
+        out.append({"id": lid, "name": str(L.get("name") or "Danh sách")[:60],
+                    "items": [t for t in (clean_track(f) for f in items[:2000]) if t]})
+    if not any(x["id"] == "fav" for x in out):
+        out.insert(0, {"id": "fav", "name": "Yêu thích", "items": []})
+    out.sort(key=lambda x: x["id"] != "fav")
+    return out
+
+
+def load_lists(data):
+    raw = json.loads(data)
+    if isinstance(raw, list) and raw and all(isinstance(x, dict) and "items" in x for x in raw):
+        return clean_lists(raw)
+    # dữ liệu bản cũ: một mảng bài hát, bài mới nhất ở đầu
+    old = [t for t in (clean_track(f) for f in raw if True) if t] if isinstance(raw, list) else []
+    return clean_lists([{"id": "fav", "name": "Yêu thích", "items": old[::-1]}])
+
+
 @app.route("/favs", methods=["GET", "PUT"])
 def favs():
     err = not_ready()
@@ -583,21 +619,21 @@ def favs():
             with dbc() as c:
                 c.execute("SELECT data FROM user_favs WHERE user_id = %s", (me["id"],))
                 row = c.fetchone()
-            return jsonify({"favs": json.loads(row[0]) if row else []})
-        items = (request.get_json(silent=True) or {}).get("favs")
-        if not isinstance(items, list) or len(items) > 2000:
+            return jsonify({"lists": load_lists(row[0]) if row else []})
+        body = request.get_json(silent=True) or {}
+        if isinstance(body.get("lists"), list):
+            lists = clean_lists(body["lists"])
+        elif isinstance(body.get("favs"), list):  # app bản cũ
+            lists = clean_lists([{"id": "fav", "name": "Yêu thích",
+                                  "items": [t for t in (clean_track(f) for f in body["favs"][:2000]) if t]}])
+        else:
             return jsonify({"error": "Dữ liệu không hợp lệ."}), 400
-        clean = []
-        for f in items:
-            if isinstance(f, dict) and re.fullmatch(r"[\w-]{6,20}", str(f.get("id", ""))):
-                clean.append({"id": f["id"], "title": str(f.get("title") or "")[:300],
-                              "artist": str(f.get("artist") or "")[:200],
-                              "mood": f.get("mood") if isinstance(f.get("mood"), str) else None,
-                              "duration": f.get("duration") if isinstance(f.get("duration"), (int, float)) else None})
+        if sum(len(x["items"]) for x in lists) > 6000:
+            return jsonify({"error": "Quá nhiều bài hát."}), 400
         with dbc() as c:
             c.execute("INSERT INTO user_favs (user_id, data) VALUES (%s, %s) "
                       "ON CONFLICT (user_id) DO UPDATE SET data = EXCLUDED.data",
-                      (me["id"], json.dumps(clean, ensure_ascii=False)))
+                      (me["id"], json.dumps(lists, ensure_ascii=False)))
         return jsonify({"ok": True})
     except Exception as e:
         print("[favs] lỗi:", repr(e))
